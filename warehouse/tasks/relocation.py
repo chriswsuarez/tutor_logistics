@@ -22,19 +22,6 @@ _STALL_TICKS_BEFORE_ERROR = 400
 # subgoal progress instead.
 _MAX_TICKS_PER_RELOCATION = 500
 
-# Cap on simultaneously in-flight relocations. The shared reservation table
-# requires a robot's destination footprint to be free not just on arrival but
-# for every tick anyone else has already committed a path through (see
-# ReservationTable.is_free_indefinitely) -- fine in the sparse, low-contention
-# traffic ordinary order fulfillment sees, but found empirically to make A*
-# searches (and their expensive max_expansions retries) pathologically
-# expensive when many robots are simultaneously threading paths through the
-# same small set of shared checkerboard corridor cells. Throttling concurrency
-# keeps route overlap rare enough for that same search to stay cheap, at the
-# cost of some upfront parallelism (still cheap overall: relocation is a
-# one-time phase against an 80k+-tick budget).
-_MAX_CONCURRENT_RELOCATIONS = 2
-
 
 def _manhattan(a: Coord, b: Coord) -> int:
     return abs(a.x - b.x) + abs(a.y - b.y)
@@ -219,15 +206,12 @@ class RelocationCoordinator:
 
     def assign_idle_robots(self, world: WorldState) -> None:
         urgent = self._blocking_pallet_ids(world)
-        active = sum(1 for c in self.controllers.values() if not c.is_idle())
 
         any_idle_wanting_work = False
         any_assigned = False
         for robot_id in sorted(self.controllers):
             controller = self.controllers[robot_id]
             if not controller.is_idle() or not self._backlog:
-                continue
-            if active >= _MAX_CONCURRENT_RELOCATIONS:
                 continue
             any_idle_wanting_work = True
             position = world.robots[robot_id].position
@@ -242,7 +226,6 @@ class RelocationCoordinator:
             self._assigned_at[pallet_id] = world.tick
             controller.assign(deque([RelocateSubGoal(pallet_id=pallet_id, target=self.targets[pallet_id])]))
             any_assigned = True
-            active += 1
 
         for controller in self.controllers.values():
             if controller.is_idle() or not controller.subgoals:

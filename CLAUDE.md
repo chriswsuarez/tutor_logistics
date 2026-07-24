@@ -14,7 +14,7 @@ Big Order" from Tutor Intelligence):
 - [tests/](tests/) — pytest suite (unit + integration + a slow full-scale smoke test)
 
 The solver reads a Worklist file (any file matching the format below, not just the Big Order) and
-emits a Submission file. It currently solves the real Big Order in ~67.1k timesteps (score) — see
+emits a Submission file. It currently solves the real Big Order in ~66.0k timesteps (score) — see
 `out/solution_relocated.txt` (current best, produced by the pallet-relocation phase described below)
 vs. the earlier `out/solution_80603.txt` (pre-relocation) and `out/solution_180387.txt` (before task
 assignment was tuned). Order/pallet selection during normal fulfillment is still fairly naive
