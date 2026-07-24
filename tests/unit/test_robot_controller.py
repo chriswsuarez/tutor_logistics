@@ -166,7 +166,20 @@ def test_shared_pick_budget_prevents_conflicting_picks_on_a_low_stock_pallet():
     assert world.robots[1].storage[0] == 0
 
 
-def test_shared_dock_budget_prevents_two_robots_docking_the_same_pallet():
+def test_replenish_routes_around_to_the_south_rather_than_docking_from_east_or_west():
+    # With only the south side ever valid for replenish docking (see
+    # _REPLENISH_DOCK_EXCLUDED_OFFSETS), two robots flanking a pallet on its
+    # east/west sides can never simultaneously be in dockable position --
+    # that scenario is now structurally impossible, so the claimed_docks
+    # shared-budget mechanism for replenish is exercised through normal
+    # play rather than by two robots racing for the same side (the dock
+    # budget itself remains covered by
+    # test_relocate_shares_dock_budget_with_claimed_docks, where multiple
+    # approach sides are still legal). This instead confirms: neither robot
+    # docks from its nearer east/west side, robot_a claims the sole south
+    # approach cell via the reservation table, and robot_b correctly waits
+    # (there's nowhere else useful for it to go) rather than doing anything
+    # wrong.
     grid = Grid(width=10, height=5)
     pallet = Pallet(id=0, sku=0, position=Coord(5, 2), count=5, max_count=5)
     robot_a = Robot(id=0, position=Coord(4, 2))
@@ -187,8 +200,8 @@ def test_shared_dock_budget_prevents_two_robots_docking_the_same_pallet():
     action_a = controller_a.propose_action(world, table, claimed_picks, claimed_docks)
     action_b = controller_b.propose_action(world, table, claimed_picks, claimed_docks)
 
-    assert action_a == Action("dock", 5, 2)
-    assert action_b is None  # pallet already claimed for docking this tick
+    assert action_a is not None and action_a.kind == "move"  # heads toward the sole valid south approach
+    assert action_b is None  # the only valid approach cell is already claimed by robot_a's committed path
 
 
 def test_relocate_drags_a_pallet_to_its_target_and_ends_undocked_there():
@@ -268,6 +281,49 @@ def test_relocate_shares_dock_budget_with_claimed_docks():
 
     assert action_a == Action("dock", 5, 2)
     assert action_b is None  # pallet already claimed for docking this tick
+
+
+def test_replenishment_always_docks_from_the_south_even_when_another_side_is_nearer():
+    # Regression test for a real bug found running the solver on the actual
+    # Big Order: a horizontally-docked pallet (approached from its east or
+    # west side) trails sideways for the whole replenishment round trip to
+    # y=height-1 and back. Since pallets only ever rest at (odd x, odd y)
+    # checkerboard cells post-relocation, that trailing cell needs an entire
+    # adjacent *pallet* column clear for the whole vertical journey -- but
+    # pallet columns have something resting in them at every other row,
+    # while a vertically-docked pallet stays within a single always-clear
+    # corridor column throughout. This produced a route genuinely absent
+    # even at 2,000,000 A* expansions on the real Big Order, not merely a
+    # slow search. Here the robot starts directly WEST of the pallet, so
+    # "nearest adjacent cell" would naturally dock it from the east/west
+    # side; the controller must route around to the south instead.
+    grid = Grid(width=10, height=8)  # replenishment row is y=7
+    robot = Robot(id=0, position=Coord(4, 3))
+    pallet = Pallet(id=0, sku=0, position=Coord(5, 3), count=1, max_count=1)
+    order = Order(id=0, requirements=Counter({0: 2}))
+    world = WorldState(grid=grid, robots={0: robot}, pallets={0: pallet}, orders=[order])
+
+    controller = RobotController(0, NearestAvailablePallet())
+    controller.assign(TaskManager.decompose(order, robot.position, world, NearestAvailablePallet()))
+
+    table = ReservationTable()
+    docked_offset = None
+    for _ in range(200):
+        planned_ids = {0} if controller.pending_path is not None else set()
+        table.sync_static_holds(world, planned_ids)
+        action = controller.propose_action(world, table)
+        actions = {}
+        if action is not None:
+            actions[0] = action
+        apply_tick(world, actions)
+        table.prune_before(world.tick)
+        if action is not None and action.kind == "dock":
+            docked_offset = next(off for off, pid in world.robots[0].docked_pallets.items() if pid == 0)
+        if world.orders[0].fulfilled:
+            break
+
+    assert world.orders[0].fulfilled
+    assert docked_offset == Coord(0, -1)  # NORTH: pallet trailed directly behind the robot, never sideways
 
 
 def test_collect_waits_rather_than_double_replenish_a_pallet_already_being_dragged():

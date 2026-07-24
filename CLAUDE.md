@@ -14,13 +14,13 @@ Big Order" from Tutor Intelligence):
 - [tests/](tests/) — pytest suite (unit + integration + a slow full-scale smoke test)
 
 The solver reads a Worklist file (any file matching the format below, not just the Big Order) and
-emits a Submission file. It currently solves the real Big Order in ~66.0k timesteps (score) — see
-`out/solution_relocated.txt` (current best, produced by the pallet-relocation phase described below)
-vs. the earlier `out/solution_80603.txt` (pre-relocation) and `out/solution_180387.txt` (before task
-assignment was tuned). Order/pallet selection during normal fulfillment is still fairly naive
-(nearest-pallet, greedy nearest-neighbor SKU routing per order); further optimizing the score
-(e.g. an order-selection cost proxy that accounts for non-hub items, or co-occurrence-aware
-slotting) is ongoing work — see `warehouse/tasks/relocation.py`'s module docstring for context.
+emits a Submission file. It currently solves the real Big Order in ~62.4k timesteps (score) — see
+`out/solution_v3.txt` (current best: pallet relocation + a farthest-required-SKU order-selection
+proxy, see below) vs. earlier checkpoints `out/solution_66044.txt`/`out/solution_67110.txt`
+(relocation only, at two different relocation-phase concurrency levels), `out/solution_80603.txt`
+(pre-relocation), and `out/solution_180387.txt` (before task assignment was first tuned). Further
+optimizing the score (e.g. co-occurrence-aware slotting within the relocation band) is ongoing work
+— see `warehouse/tasks/relocation.py`'s module docstring for context.
 
 ### Commands
 
@@ -68,12 +68,21 @@ one up first with `python -m venv .venv && .venv/bin/pip install -e ".[dev]"`.
 - `warehouse/tasks/` — `RobotController` (per-robot FSM; re-derives its phase from ground-truth
   world state each tick rather than trusting a separately-tracked flag) and `TaskManager` (assigns
   unfulfilled orders to idle robots via a swappable `OrderSelectionPolicy`/`PalletSelectionPolicy`).
-  Replenishment is a `ReplenishSubGoal`: dock (never from the pallet's north side — that would put
-  the pallet on the robot's south side, unable to reach the replenishment row without going out of
-  bounds) → travel to `y=height-1` (auto-refills at tick end) → **drag the pallet back to where it
-  came from** before undocking (leaving it parked on the replenishment row would, over many trips,
-  accumulate into a wall of pallets that can wedge others — or itself, next time — permanently out
-  of reach) → resume collecting. `nearest_pallet_of_sku`'s `exclude_docked` skips any pallet already
+  Replenishment is a `ReplenishSubGoal`: dock (**only ever from the pallet's south side** —
+  `_REPLENISH_DOCK_EXCLUDED_OFFSETS` excludes north/east/west, forcing `dock_offset=NORTH`) → travel
+  to `y=height-1` (auto-refills at tick end) → **drag the pallet back to where it came from** before
+  undocking (leaving it parked on the replenishment row would, over many trips, accumulate into a
+  wall of pallets that can wedge others — or itself, next time — permanently out of reach) → resume
+  collecting. North is excluded because a south-docked pallet could never reach `y=height-1` without
+  going out of bounds; east/west are excluded because, post-relocation, a horizontally-docked pallet
+  trails sideways for the whole (long, near-full-height) round trip, and since pallets only ever rest
+  at `(odd x, odd y)` checkerboard cells (see `relocation.py` below), that trailing cell needs an
+  *entire adjacent pallet column* clear for the whole journey — but pallet columns have something
+  resting in them at every other row. A vertically-docked pallet instead stays within one
+  always-clear corridor column the entire trip. Confirmed empirically: a horizontally-docked
+  replenish drag produced a route genuinely absent even at 2,000,000 A* expansions (not merely slow
+  — the identical footprint-free search found a path in milliseconds), stalling a robot for hundreds
+  of ticks before this fix. `nearest_pallet_of_sku`'s `exclude_docked` skips any pallet already
   docked to another robot when picking a replenish target: without it, a second robot independently
   discovering the same empty SKU can capture that pallet's *current mid-transit* coordinate as its
   own `ReplenishSubGoal.origin`, then try to permanently drag it back to a meaningless waypoint deep
@@ -96,6 +105,13 @@ one up first with `python -m venv .venv && .venv/bin/pip install -e ".[dev]"`.
   (genuinely unreachable even at 2,000,000 A* expansions, not just slow). See the module's and
   class's docstrings for the fuller history of rejected designs (a hard per-row barrier, a
   soft-row-preference tiebreak) and why each one either deadlocked or created corridor contention.
+- `warehouse/tasks/order_selector.py` — `NearestOrderSelector` picks, for each idle robot, the
+  unclaimed order whose **farthest** required SKU (not closest) is nearest to the robot. Once
+  relocation clusters pallets into a compact near-`y=0` band, nearly every order shares one of a
+  handful of near-universal SKUs (e.g. present in 995 of 1000 real-Big-Order orders) sitting right
+  next to the fulfillment row, so "closest required SKU" is ~0 for almost every order alike and
+  can't discriminate between them; `TaskManager.decompose`'s tour is star-shaped from that near-fixed
+  hub, so its length is dominated by the trip out to whichever required SKU sits *farthest* away.
 - `warehouse/sim_driver.py` — `SimulationDriver` ties it together tick by tick: run the relocation
   phase to completion (unless `relocate_pallets=False`), then loop: assign idle robots → resync
   reservation table → each controller proposes at most one action (threading shared per-tick

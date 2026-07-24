@@ -4,7 +4,7 @@ from collections import Counter, deque
 from typing import Optional
 
 from warehouse.model.action import Action
-from warehouse.model.grid import NORTH, Coord
+from warehouse.model.grid import EAST, NORTH, WEST, Coord
 from warehouse.model.world import WorldState
 from warehouse.planning.cooperative_astar import GoalSpec, adjacent_to, any_row, exact_cell, plan
 from warehouse.planning.reservation import ReservationTable
@@ -12,10 +12,28 @@ from warehouse.tasks.pallet_selector import PalletSelectionPolicy, nearest_palle
 from warehouse.tasks.task_types import CollectSkuSubGoal, DeliverSubGoal, RelocateSubGoal, ReplenishSubGoal, SubGoal
 
 _RETRY_MAX_EXPANSIONS = 200_000
-# Approaching a pallet from its north cell docks it to the robot's south side,
-# which can then never reach the replenishment row (y = height-1) without the
-# pallet going out of bounds. Excluded specifically for replenish docking.
-_REPLENISH_DOCK_EXCLUDED_OFFSETS = frozenset({NORTH})
+# Replenish docking only ever approaches a pallet from its south cell (the
+# only offset left unexcluded here), forcing dock_offset=NORTH -- the pallet
+# trails directly behind the robot in the same column for the whole trip.
+# Two reasons, one boundary and one structural:
+#  - Approaching from the north (dock_offset=SOUTH) can never reach the
+#    replenishment row (y=height-1): the pallet would need to sit one row
+#    past it, out of bounds.
+#  - Approaching from the east or west (dock_offset=WEST/EAST) leaves the
+#    pallet trailing sideways for the whole (long, roughly full-height)
+#    round trip to y=height-1 and back to its relocated checkerboard slot.
+#    Since pallets only ever rest at (odd x, odd y) -- see
+#    warehouse/tasks/relocation.py -- a horizontally-offset drag's trailing
+#    cell needs an entire adjacent *pallet* column clear for the whole
+#    journey, but pallet columns have something resting in them at every
+#    other row. A vertically-offset drag instead stays within a single
+#    corridor column (always clear by construction) the entire way.
+#    Confirmed empirically: a horizontally-offset replenish drag produced a
+#    route genuinely absent even at 2,000,000 A* expansions (not merely
+#    slow -- the same footprint search with the docked pallet removed found
+#    a path in a handful of milliseconds), stalling a robot for hundreds of
+#    ticks before the fix.
+_REPLENISH_DOCK_EXCLUDED_OFFSETS = frozenset({NORTH, EAST, WEST})
 # Consecutive tick-failures to find any path before trying a sidestep (see
 # _advance_along_path_to's fallback and the class docstring's deadlock note).
 _STUCK_TICKS_BEFORE_SIDESTEP = 15
@@ -151,9 +169,8 @@ class RobotController:
         pallet = world.pallets[subgoal.pallet_id]
 
         if pallet.docked_to != self.robot_id:
-            valid_approach_cells = {
-                c for c in world.grid.neighbors4(pallet.position) if c != pallet.position + NORTH
-            }
+            excluded_cells = {pallet.position + off for off in _REPLENISH_DOCK_EXCLUDED_OFFSETS}
+            valid_approach_cells = {c for c in world.grid.neighbors4(pallet.position) if c not in excluded_cells}
             if robot.position not in valid_approach_cells:
                 return self._advance_along_path_to(
                     adjacent_to(pallet.position, world.grid, exclude_offsets=_REPLENISH_DOCK_EXCLUDED_OFFSETS),
