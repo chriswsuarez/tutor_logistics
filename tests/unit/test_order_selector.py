@@ -52,16 +52,29 @@ def test_nearest_order_selector_picks_the_closer_orders_pallet():
     assert selector.select(world, claimed_order_ids=set(), from_coord=Coord(0, 0)) == 1
 
 
-def test_nearest_order_selector_uses_the_orders_closest_required_sku():
+def test_nearest_order_selector_uses_the_orders_farthest_required_sku():
+    # Farthest, not closest: once relocation clusters pallets into a compact
+    # band, a near-universal SKU sitting right next to every order makes
+    # "closest required SKU" ~0 for almost everything -- useless for telling
+    # orders apart. Farthest-required-SKU distance is what actually
+    # correlates with the star-shaped tour's length (see class docstring).
+    # Order 0's closest SKU (distance 5) beats order 1's closest (10), but
+    # order 0's farthest (50) is worse than order 1's farthest (12) -- a
+    # farthest-based selector must prefer order 1, the opposite of what a
+    # closest-based one would pick.
     pallets = {
-        0: Pallet(id=0, sku=0, position=Coord(20, 20), count=5, max_count=5),
-        1: Pallet(id=1, sku=1, position=Coord(1, 0), count=5, max_count=5),
+        0: Pallet(id=0, sku=0, position=Coord(5, 0), count=5, max_count=5),
+        1: Pallet(id=1, sku=1, position=Coord(50, 0), count=5, max_count=5),
+        2: Pallet(id=2, sku=2, position=Coord(10, 0), count=5, max_count=5),
+        3: Pallet(id=3, sku=3, position=Coord(12, 0), count=5, max_count=5),
     }
-    # order 0 needs both skus; its *closest* one (sku 1) is right next to the robot
-    orders = [Order(id=0, requirements=Counter({0: 1, 1: 1}))]
+    orders = [
+        Order(id=0, requirements=Counter({0: 1, 1: 1})),  # closest=5, farthest=50
+        Order(id=1, requirements=Counter({2: 1, 3: 1})),  # closest=10, farthest=12
+    ]
     world = make_world(orders, pallets)
     selector = NearestOrderSelector(NearestAvailablePallet())
-    assert selector.select(world, claimed_order_ids=set(), from_coord=Coord(0, 0)) == 0
+    assert selector.select(world, claimed_order_ids=set(), from_coord=Coord(0, 0)) == 1
 
 
 def test_nearest_order_selector_falls_back_to_any_pallet_when_sku_out_of_stock():

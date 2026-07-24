@@ -11,7 +11,7 @@ from warehouse.sim.engine import apply_tick
 from warehouse.tasks.pallet_selector import NearestAvailablePallet
 from warehouse.tasks.robot_controller import RobotController
 from warehouse.tasks.task_manager import TaskManager
-from warehouse.tasks.task_types import CollectSkuSubGoal, ReplenishSubGoal
+from warehouse.tasks.task_types import CollectSkuSubGoal, RelocateSubGoal, ReplenishSubGoal
 
 
 def run_single_robot_to_completion(world: WorldState, controller: RobotController, max_ticks: int = 500) -> list[str]:
@@ -166,7 +166,20 @@ def test_shared_pick_budget_prevents_conflicting_picks_on_a_low_stock_pallet():
     assert world.robots[1].storage[0] == 0
 
 
-def test_shared_dock_budget_prevents_two_robots_docking_the_same_pallet():
+def test_replenish_routes_around_to_the_south_rather_than_docking_from_east_or_west():
+    # With only the south side ever valid for replenish docking (see
+    # _REPLENISH_DOCK_EXCLUDED_OFFSETS), two robots flanking a pallet on its
+    # east/west sides can never simultaneously be in dockable position --
+    # that scenario is now structurally impossible, so the claimed_docks
+    # shared-budget mechanism for replenish is exercised through normal
+    # play rather than by two robots racing for the same side (the dock
+    # budget itself remains covered by
+    # test_relocate_shares_dock_budget_with_claimed_docks, where multiple
+    # approach sides are still legal). This instead confirms: neither robot
+    # docks from its nearer east/west side, robot_a claims the sole south
+    # approach cell via the reservation table, and robot_b correctly waits
+    # (there's nowhere else useful for it to go) rather than doing anything
+    # wrong.
     grid = Grid(width=10, height=5)
     pallet = Pallet(id=0, sku=0, position=Coord(5, 2), count=5, max_count=5)
     robot_a = Robot(id=0, position=Coord(4, 2))
@@ -187,8 +200,161 @@ def test_shared_dock_budget_prevents_two_robots_docking_the_same_pallet():
     action_a = controller_a.propose_action(world, table, claimed_picks, claimed_docks)
     action_b = controller_b.propose_action(world, table, claimed_picks, claimed_docks)
 
+    assert action_a is not None and action_a.kind == "move"  # heads toward the sole valid south approach
+    assert action_b is None  # the only valid approach cell is already claimed by robot_a's committed path
+
+
+def test_relocate_drags_a_pallet_to_its_target_and_ends_undocked_there():
+    grid = Grid(width=10, height=5)
+    robot = Robot(id=0, position=Coord(5, 2))
+    pallet = Pallet(id=0, sku=0, position=Coord(6, 2), count=5, max_count=5)
+    world = WorldState(grid=grid, robots={0: robot}, pallets={0: pallet}, orders=[])
+
+    controller = RobotController(0, NearestAvailablePallet())
+    controller.assign(deque([RelocateSubGoal(pallet_id=0, target=Coord(1, 1))]))
+
+    emitted = run_single_robot_to_completion(world, controller)
+
+    assert "dock" in emitted
+    assert "undock" in emitted
+    assert world.pallets[0].position == Coord(1, 1)
+    assert world.pallets[0].docked_to is None
+
+
+def test_relocate_is_a_noop_when_pallet_already_at_target():
+    grid = Grid(width=10, height=5)
+    robot = Robot(id=0, position=Coord(5, 2))
+    pallet = Pallet(id=0, sku=0, position=Coord(6, 2), count=5, max_count=5)
+    world = WorldState(grid=grid, robots={0: robot}, pallets={0: pallet}, orders=[])
+
+    controller = RobotController(0, NearestAvailablePallet())
+    controller.assign(deque([RelocateSubGoal(pallet_id=0, target=Coord(6, 2))]))
+
+    table = ReservationTable()
+    table.sync_static_holds(world, set())
+    action = controller.propose_action(world, table)
+
+    assert action is None
+    assert controller.is_idle()  # subgoal dropped immediately, no dock/undock needed
+
+
+def test_relocate_permits_the_north_approach():
+    # Explicit regression guard that _step_relocate does NOT share
+    # ReplenishSubGoal's north-approach exclusion: relocation targets sit
+    # deep inside the grid, never near y=height-1, so docking a pallet to the
+    # robot's south side (by approaching from the north) is never a problem
+    # here. The robot starts directly north of the pallet, so "nearest
+    # adjacent cell" naturally is the side replenishment would have forbidden.
+    grid = Grid(width=10, height=8)
+    robot = Robot(id=0, position=Coord(5, 1))
+    pallet = Pallet(id=0, sku=0, position=Coord(5, 3), count=5, max_count=5)
+    world = WorldState(grid=grid, robots={0: robot}, pallets={0: pallet}, orders=[])
+
+    controller = RobotController(0, NearestAvailablePallet())
+    controller.assign(deque([RelocateSubGoal(pallet_id=0, target=Coord(2, 1))]))
+
+    emitted = run_single_robot_to_completion(world, controller, max_ticks=200)
+
+    assert world.pallets[0].position == Coord(2, 1)
+    assert world.pallets[0].docked_to is None
+
+
+def test_relocate_shares_dock_budget_with_claimed_docks():
+    grid = Grid(width=10, height=5)
+    pallet = Pallet(id=0, sku=0, position=Coord(5, 2), count=5, max_count=5)
+    robot_a = Robot(id=0, position=Coord(4, 2))
+    robot_b = Robot(id=1, position=Coord(6, 2))
+    world = WorldState(grid=grid, robots={0: robot_a, 1: robot_b}, pallets={0: pallet}, orders=[])
+
+    controller_a = RobotController(0, NearestAvailablePallet())
+    controller_b = RobotController(1, NearestAvailablePallet())
+    controller_a.assign(deque([RelocateSubGoal(pallet_id=0, target=Coord(1, 1))]))
+    controller_b.assign(deque([RelocateSubGoal(pallet_id=0, target=Coord(1, 1))]))
+
+    table = ReservationTable()
+    table.sync_static_holds(world, set())
+    claimed_picks: Counter = Counter()
+    claimed_docks: set[int] = set()
+
+    action_a = controller_a.propose_action(world, table, claimed_picks, claimed_docks)
+    action_b = controller_b.propose_action(world, table, claimed_picks, claimed_docks)
+
     assert action_a == Action("dock", 5, 2)
     assert action_b is None  # pallet already claimed for docking this tick
+
+
+def test_replenishment_always_docks_from_the_south_even_when_another_side_is_nearer():
+    # Regression test for a real bug found running the solver on the actual
+    # Big Order: a horizontally-docked pallet (approached from its east or
+    # west side) trails sideways for the whole replenishment round trip to
+    # y=height-1 and back. Since pallets only ever rest at (odd x, odd y)
+    # checkerboard cells post-relocation, that trailing cell needs an entire
+    # adjacent *pallet* column clear for the whole vertical journey -- but
+    # pallet columns have something resting in them at every other row,
+    # while a vertically-docked pallet stays within a single always-clear
+    # corridor column throughout. This produced a route genuinely absent
+    # even at 2,000,000 A* expansions on the real Big Order, not merely a
+    # slow search. Here the robot starts directly WEST of the pallet, so
+    # "nearest adjacent cell" would naturally dock it from the east/west
+    # side; the controller must route around to the south instead.
+    grid = Grid(width=10, height=8)  # replenishment row is y=7
+    robot = Robot(id=0, position=Coord(4, 3))
+    pallet = Pallet(id=0, sku=0, position=Coord(5, 3), count=1, max_count=1)
+    order = Order(id=0, requirements=Counter({0: 2}))
+    world = WorldState(grid=grid, robots={0: robot}, pallets={0: pallet}, orders=[order])
+
+    controller = RobotController(0, NearestAvailablePallet())
+    controller.assign(TaskManager.decompose(order, robot.position, world, NearestAvailablePallet()))
+
+    table = ReservationTable()
+    docked_offset = None
+    for _ in range(200):
+        planned_ids = {0} if controller.pending_path is not None else set()
+        table.sync_static_holds(world, planned_ids)
+        action = controller.propose_action(world, table)
+        actions = {}
+        if action is not None:
+            actions[0] = action
+        apply_tick(world, actions)
+        table.prune_before(world.tick)
+        if action is not None and action.kind == "dock":
+            docked_offset = next(off for off, pid in world.robots[0].docked_pallets.items() if pid == 0)
+        if world.orders[0].fulfilled:
+            break
+
+    assert world.orders[0].fulfilled
+    assert docked_offset == Coord(0, -1)  # NORTH: pallet trailed directly behind the robot, never sideways
+
+
+def test_collect_waits_rather_than_double_replenish_a_pallet_already_being_dragged():
+    # Regression test for a real bug found running the solver on the actual
+    # Big Order: pallet has zero stock and is already docked to (being
+    # replenished by) a DIFFERENT robot -- mid-transit, not resting anywhere
+    # meaningful. A second robot independently needing the same SKU must not
+    # fabricate its own ReplenishSubGoal capturing that transient position as
+    # "origin": it would try to permanently settle a drag on whatever cell
+    # the first robot happens to be passing through right now, which can be
+    # arbitrarily far from -- and much harder to reach than -- the pallet's
+    # true rest position (this produced a near-unreachable target deep in
+    # busy traffic that burned full-budget A* searches every tick for
+    # hundreds of ticks). It should simply wait instead.
+    grid = Grid(width=10, height=8)
+    pallet = Pallet(id=0, sku=0, position=Coord(3, 3), count=0, max_count=5, docked_to=1, dock_offset=Coord(1, 0))
+    other_robot = Robot(id=1, position=Coord(2, 3))
+    other_robot.docked_pallets[Coord(1, 0)] = 0
+    robot = Robot(id=0, position=Coord(5, 3))
+    world = WorldState(grid=grid, robots={0: robot, 1: other_robot}, pallets={0: pallet}, orders=[])
+
+    controller = RobotController(0, NearestAvailablePallet())
+    controller.assign(deque([CollectSkuSubGoal(sku=0, quantity=1)]))
+
+    table = ReservationTable()
+    table.sync_static_holds(world, set())
+    action = controller.propose_action(world, table)
+
+    assert action is None
+    assert len(controller.subgoals) == 1  # no bogus ReplenishSubGoal appended
+    assert isinstance(controller.subgoals[0], CollectSkuSubGoal)
 
 
 def test_replenish_fallback_skips_a_pallet_boxed_in_by_other_pallets():

@@ -31,3 +31,10 @@ class ReplenishSubGoal(SubGoal):
     # afterward instead of being left parked on the replenishment row -- otherwise pallets
     # accumulate there over many trips until some become permanently wedged between others,
     # unreachable for all future replenishment
+
+
+@dataclass
+class RelocateSubGoal(SubGoal):
+    pallet_id: int
+    target: Coord  # permanent resting cell to drag this pallet to; standalone (no resume --
+    # unlike ReplenishSubGoal, relocation isn't interrupting anything)

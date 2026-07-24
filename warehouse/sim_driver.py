@@ -12,6 +12,7 @@ from warehouse.sim.engine import apply_tick
 from warehouse.sim.exceptions import InvalidActionError, RuleViolation
 from warehouse.tasks.order_selector import NearestOrderSelector
 from warehouse.tasks.pallet_selector import NearestAvailablePallet
+from warehouse.tasks.relocation import RelocationCoordinator, plan_relocations
 from warehouse.tasks.robot_controller import RobotController
 from warehouse.tasks.task_manager import TaskManager
 
@@ -28,6 +29,15 @@ class SimulationDriver:
     """Ties the reservation table, task manager, robot controllers, and
     simulation engine together tick by tick, producing a SubmissionLog.
 
+    Unless `relocate_pallets=False`, `run()` first drives a one-time upfront
+    phase (`RelocationCoordinator`, see warehouse/tasks/relocation.py) that
+    permanently drags every pallet to a demand-ranked slot near y=0, before
+    normal order fulfillment begins. Both phases share this same tick loop
+    (`_run_one_tick`'s `assigner` param picks which one populates idle
+    robots' subgoal queues that tick) and the same `controllers` dict, so the
+    reservation table, conflict-avoidance counters, recovery, and stall
+    watchdog below apply identically to either.
+
     Each tick: (a) idle robots get a new order; (b) the shared reservation
     table's static holds are resynced from the current world state; (c) every
     controller proposes at most one action, in a fixed ascending-robot-id
@@ -39,7 +49,7 @@ class SimulationDriver:
     RobotController._advance_along_path_to).
     """
 
-    def __init__(self, world: WorldState, config: Optional[SimConfig] = None):
+    def __init__(self, world: WorldState, config: Optional[SimConfig] = None, relocate_pallets: bool = True):
         self.world = world
         self.config = config or SimConfig()
         self.reservation_table = ReservationTable()
@@ -47,9 +57,14 @@ class SimulationDriver:
         controllers = {rid: RobotController(rid, pallet_selector) for rid in world.robots}
         self.task_manager = TaskManager(controllers, NearestOrderSelector(pallet_selector), pallet_selector)
         self._stall_counts = {rid: 0 for rid in world.robots}
+        self.relocation_coordinator = (
+            RelocationCoordinator(controllers, plan_relocations(world), world) if relocate_pallets else None
+        )
 
     def run(self) -> SubmissionLog:
         log = SubmissionLog()
+        if self.relocation_coordinator is not None:
+            self._run_relocation_phase(log)
         while not self.world.all_orders_fulfilled():
             if self.world.tick >= self.config.max_ticks:
                 raise IncompleteSolutionError(
@@ -58,8 +73,23 @@ class SimulationDriver:
             self._run_one_tick(log)
         return log
 
-    def _run_one_tick(self, log: SubmissionLog) -> None:
-        self.task_manager.assign_idle_robots(self.world)
+    def _run_relocation_phase(self, log: SubmissionLog) -> None:
+        """Upfront, one-time: drag every pallet to its demand-ranked slot near
+        y=0 (see warehouse/tasks/relocation.py) before normal order
+        fulfillment starts, so the bulk of order-fulfillment travel -- the
+        dominant cost, per profiling against the real Big Order -- collapses
+        from being spread across the whole warehouse to a compact band."""
+        coordinator = self.relocation_coordinator
+        while not coordinator.is_done():
+            if self.world.tick >= self.config.max_ticks:
+                raise IncompleteSolutionError(f"relocation phase exceeded max_ticks={self.config.max_ticks}")
+            self._run_one_tick(log, assigner=coordinator)
+        self.relocation_coordinator = None
+
+    def _run_one_tick(
+        self, log: SubmissionLog, assigner: Optional[TaskManager | RelocationCoordinator] = None
+    ) -> None:
+        (assigner or self.task_manager).assign_idle_robots(self.world)
 
         planned_ids = {
             rid for rid, controller in self.task_manager.controllers.items() if controller.pending_path is not None
