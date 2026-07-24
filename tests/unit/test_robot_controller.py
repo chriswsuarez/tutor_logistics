@@ -11,7 +11,7 @@ from warehouse.sim.engine import apply_tick
 from warehouse.tasks.pallet_selector import NearestAvailablePallet
 from warehouse.tasks.robot_controller import RobotController
 from warehouse.tasks.task_manager import TaskManager
-from warehouse.tasks.task_types import CollectSkuSubGoal, ReplenishSubGoal
+from warehouse.tasks.task_types import CollectSkuSubGoal, RelocateSubGoal, ReplenishSubGoal
 
 
 def run_single_robot_to_completion(world: WorldState, controller: RobotController, max_ticks: int = 500) -> list[str]:
@@ -189,6 +189,116 @@ def test_shared_dock_budget_prevents_two_robots_docking_the_same_pallet():
 
     assert action_a == Action("dock", 5, 2)
     assert action_b is None  # pallet already claimed for docking this tick
+
+
+def test_relocate_drags_a_pallet_to_its_target_and_ends_undocked_there():
+    grid = Grid(width=10, height=5)
+    robot = Robot(id=0, position=Coord(5, 2))
+    pallet = Pallet(id=0, sku=0, position=Coord(6, 2), count=5, max_count=5)
+    world = WorldState(grid=grid, robots={0: robot}, pallets={0: pallet}, orders=[])
+
+    controller = RobotController(0, NearestAvailablePallet())
+    controller.assign(deque([RelocateSubGoal(pallet_id=0, target=Coord(1, 1))]))
+
+    emitted = run_single_robot_to_completion(world, controller)
+
+    assert "dock" in emitted
+    assert "undock" in emitted
+    assert world.pallets[0].position == Coord(1, 1)
+    assert world.pallets[0].docked_to is None
+
+
+def test_relocate_is_a_noop_when_pallet_already_at_target():
+    grid = Grid(width=10, height=5)
+    robot = Robot(id=0, position=Coord(5, 2))
+    pallet = Pallet(id=0, sku=0, position=Coord(6, 2), count=5, max_count=5)
+    world = WorldState(grid=grid, robots={0: robot}, pallets={0: pallet}, orders=[])
+
+    controller = RobotController(0, NearestAvailablePallet())
+    controller.assign(deque([RelocateSubGoal(pallet_id=0, target=Coord(6, 2))]))
+
+    table = ReservationTable()
+    table.sync_static_holds(world, set())
+    action = controller.propose_action(world, table)
+
+    assert action is None
+    assert controller.is_idle()  # subgoal dropped immediately, no dock/undock needed
+
+
+def test_relocate_permits_the_north_approach():
+    # Explicit regression guard that _step_relocate does NOT share
+    # ReplenishSubGoal's north-approach exclusion: relocation targets sit
+    # deep inside the grid, never near y=height-1, so docking a pallet to the
+    # robot's south side (by approaching from the north) is never a problem
+    # here. The robot starts directly north of the pallet, so "nearest
+    # adjacent cell" naturally is the side replenishment would have forbidden.
+    grid = Grid(width=10, height=8)
+    robot = Robot(id=0, position=Coord(5, 1))
+    pallet = Pallet(id=0, sku=0, position=Coord(5, 3), count=5, max_count=5)
+    world = WorldState(grid=grid, robots={0: robot}, pallets={0: pallet}, orders=[])
+
+    controller = RobotController(0, NearestAvailablePallet())
+    controller.assign(deque([RelocateSubGoal(pallet_id=0, target=Coord(2, 1))]))
+
+    emitted = run_single_robot_to_completion(world, controller, max_ticks=200)
+
+    assert world.pallets[0].position == Coord(2, 1)
+    assert world.pallets[0].docked_to is None
+
+
+def test_relocate_shares_dock_budget_with_claimed_docks():
+    grid = Grid(width=10, height=5)
+    pallet = Pallet(id=0, sku=0, position=Coord(5, 2), count=5, max_count=5)
+    robot_a = Robot(id=0, position=Coord(4, 2))
+    robot_b = Robot(id=1, position=Coord(6, 2))
+    world = WorldState(grid=grid, robots={0: robot_a, 1: robot_b}, pallets={0: pallet}, orders=[])
+
+    controller_a = RobotController(0, NearestAvailablePallet())
+    controller_b = RobotController(1, NearestAvailablePallet())
+    controller_a.assign(deque([RelocateSubGoal(pallet_id=0, target=Coord(1, 1))]))
+    controller_b.assign(deque([RelocateSubGoal(pallet_id=0, target=Coord(1, 1))]))
+
+    table = ReservationTable()
+    table.sync_static_holds(world, set())
+    claimed_picks: Counter = Counter()
+    claimed_docks: set[int] = set()
+
+    action_a = controller_a.propose_action(world, table, claimed_picks, claimed_docks)
+    action_b = controller_b.propose_action(world, table, claimed_picks, claimed_docks)
+
+    assert action_a == Action("dock", 5, 2)
+    assert action_b is None  # pallet already claimed for docking this tick
+
+
+def test_collect_waits_rather_than_double_replenish_a_pallet_already_being_dragged():
+    # Regression test for a real bug found running the solver on the actual
+    # Big Order: pallet has zero stock and is already docked to (being
+    # replenished by) a DIFFERENT robot -- mid-transit, not resting anywhere
+    # meaningful. A second robot independently needing the same SKU must not
+    # fabricate its own ReplenishSubGoal capturing that transient position as
+    # "origin": it would try to permanently settle a drag on whatever cell
+    # the first robot happens to be passing through right now, which can be
+    # arbitrarily far from -- and much harder to reach than -- the pallet's
+    # true rest position (this produced a near-unreachable target deep in
+    # busy traffic that burned full-budget A* searches every tick for
+    # hundreds of ticks). It should simply wait instead.
+    grid = Grid(width=10, height=8)
+    pallet = Pallet(id=0, sku=0, position=Coord(3, 3), count=0, max_count=5, docked_to=1, dock_offset=Coord(1, 0))
+    other_robot = Robot(id=1, position=Coord(2, 3))
+    other_robot.docked_pallets[Coord(1, 0)] = 0
+    robot = Robot(id=0, position=Coord(5, 3))
+    world = WorldState(grid=grid, robots={0: robot, 1: other_robot}, pallets={0: pallet}, orders=[])
+
+    controller = RobotController(0, NearestAvailablePallet())
+    controller.assign(deque([CollectSkuSubGoal(sku=0, quantity=1)]))
+
+    table = ReservationTable()
+    table.sync_static_holds(world, set())
+    action = controller.propose_action(world, table)
+
+    assert action is None
+    assert len(controller.subgoals) == 1  # no bogus ReplenishSubGoal appended
+    assert isinstance(controller.subgoals[0], CollectSkuSubGoal)
 
 
 def test_replenish_fallback_skips_a_pallet_boxed_in_by_other_pallets():

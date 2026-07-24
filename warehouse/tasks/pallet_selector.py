@@ -46,6 +46,7 @@ def nearest_pallet_of_sku(
     require_reachable: bool = False,
     excluded_offsets: frozenset[Coord] = frozenset(),
     fallback_to_nearest: bool = True,
+    exclude_docked: bool = False,
 ) -> Optional[int]:
     """Nearest pallet of `sku` to `from_coord` (ties broken by pallet id).
     With `require_stock=True`, only considers pallets with count > 0 (returns
@@ -65,8 +66,26 @@ def nearest_pallet_of_sku(
     only one with stock -- that would deadlock every future need for the SKU
     forever. Returning None here tells the caller "no usable stock right
     now," which correctly falls through to the replenish path instead,
-    where a reachable-but-empty sibling can be refilled and used)."""
-    candidates = [p for p in world.pallets.values() if p.sku == sku and (not require_stock or p.count > 0)]
+    where a reachable-but-empty sibling can be refilled and used).
+
+    With `exclude_docked=True`, skips any pallet currently docked to a robot
+    (mid-replenishment already) with no fallback -- used by the replenish
+    fallback specifically, to stop a second robot from independently
+    "replenishing" a pallet that's already being dragged by someone else. A
+    docked pallet's position is a *transient* mid-flight coordinate, not a
+    resting spot; capturing it as a `ReplenishSubGoal.origin` sends the
+    second robot to permanently settle on whatever cell the first robot
+    happened to be passing through, which can be arbitrarily far from -- and
+    much harder to reach than -- the pallet's true rest position (found
+    empirically: this produced a near-unreachable drag target deep in busy
+    traffic, burning full-budget A* searches every tick for hundreds of
+    ticks). None here tells the caller "wait" rather than fabricating a
+    bogus target."""
+    candidates = [
+        p
+        for p in world.pallets.values()
+        if p.sku == sku and (not require_stock or p.count > 0) and (not exclude_docked or p.docked_to is None)
+    ]
     if not candidates:
         return None
     candidates.sort(key=lambda p: (_manhattan(from_coord, p.position), p.id))

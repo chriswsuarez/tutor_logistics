@@ -14,15 +14,18 @@ Big Order" from Tutor Intelligence):
 - [tests/](tests/) — pytest suite (unit + integration + a slow full-scale smoke test)
 
 The solver reads a Worklist file (any file matching the format below, not just the Big Order) and
-emits a Submission file. It currently solves the real Big Order in ~180k timesteps (score), taking
-roughly 2 minutes of wall-clock compute. Task/pallet assignment is deliberately naive
-(nearest-pallet, FIFO orders, no SKU batching) — see "V1 priority" note in the architecture plan
-history; optimizing the score is future work, not yet done.
+emits a Submission file. It currently solves the real Big Order in ~67.1k timesteps (score) — see
+`out/solution_relocated.txt` (current best, produced by the pallet-relocation phase described below)
+vs. the earlier `out/solution_80603.txt` (pre-relocation) and `out/solution_180387.txt` (before task
+assignment was tuned). Order/pallet selection during normal fulfillment is still fairly naive
+(nearest-pallet, greedy nearest-neighbor SKU routing per order); further optimizing the score
+(e.g. an order-selection cost proxy that accounts for non-hub items, or co-occurrence-aware
+slotting) is ongoing work — see `warehouse/tasks/relocation.py`'s module docstring for context.
 
 ### Commands
 
-A project-local virtualenv lives at `.venv/` (stdlib-only at runtime; `pytest`/`ruff` as dev deps
-via `pip install -e ".[dev]"`).
+The runtime itself is stdlib-only; `pytest`/`ruff` are dev deps. No virtualenv is checked in — set
+one up first with `python -m venv .venv && .venv/bin/pip install -e ".[dev]"`.
 
 - `.venv/bin/pytest` — fast unit + integration tests (excludes the slow Big Order run by default,
   configured via `addopts` in `pyproject.toml`)
@@ -70,14 +73,37 @@ via `pip install -e ".[dev]"`).
   bounds) → travel to `y=height-1` (auto-refills at tick end) → **drag the pallet back to where it
   came from** before undocking (leaving it parked on the replenishment row would, over many trips,
   accumulate into a wall of pallets that can wedge others — or itself, next time — permanently out
-  of reach) → resume collecting.
-- `warehouse/sim_driver.py` — `SimulationDriver` ties it together tick by tick: assign idle robots
-  → resync reservation table → each controller proposes at most one action (threading shared
-  per-tick pick/dock claim counters so two robots sharing a low-stock pallet or an empty pallet to
-  replenish don't each independently propose a conflicting action every tick forever) → apply the
-  batch, with defensive recovery (drop and force-replan just the offending robot(s) rather than
-  crash) if the engine ever rejects an action → log → prune. A stall watchdog triggers a global
-  replan if any robot makes no progress for too many consecutive ticks.
+  of reach) → resume collecting. `nearest_pallet_of_sku`'s `exclude_docked` skips any pallet already
+  docked to another robot when picking a replenish target: without it, a second robot independently
+  discovering the same empty SKU can capture that pallet's *current mid-transit* coordinate as its
+  own `ReplenishSubGoal.origin`, then try to permanently drag it back to a meaningless waypoint deep
+  in traffic instead of its true resting spot — found empirically to burn full-budget A* searches
+  every tick for hundreds of ticks.
+- `warehouse/tasks/relocation.py` — a one-time upfront phase (`RelocationCoordinator`), run before
+  normal order fulfillment, that permanently drags every pallet to a demand-ranked slot near `y=0`
+  (`plan_relocations`; SKUs ranked by distinct-order-visit-count, most-visited closest to the
+  fulfillment row). This is the single biggest lever found so far: profiling showed ~97% of all
+  actions in a solve are `move`, and per-leg travel distance is dominated by how far scattered
+  pallets sit from the delivery row, not by routing quality (the existing greedy nearest-neighbor
+  tour in `TaskManager.decompose` is already close to the achievable rate for a given layout).
+  Pallets rest only at `(odd x, odd y)` cells — a full checkerboard, not just corridor *columns* —
+  so every neighbor of a target is structurally guaranteed a corridor cell regardless of which side
+  a drag approaches from; a column-only scheme was tried and found to deadlock (a robot's landing
+  cell could land on a *different* pallet's own permanent target). Assignment is greedy
+  nearest-slot-first in demand-rank order, not a rigid row-major fill, because a long drag with a
+  *fixed* dock offset can leave a robot's rigid 2-cell footprint with no valid route at all through
+  the combination of still-scattered originals and partially-filled slots — confirmed empirically
+  (genuinely unreachable even at 2,000,000 A* expansions, not just slow). See the module's and
+  class's docstrings for the fuller history of rejected designs (a hard per-row barrier, a
+  soft-row-preference tiebreak) and why each one either deadlocked or created corridor contention.
+- `warehouse/sim_driver.py` — `SimulationDriver` ties it together tick by tick: run the relocation
+  phase to completion (unless `relocate_pallets=False`), then loop: assign idle robots → resync
+  reservation table → each controller proposes at most one action (threading shared per-tick
+  pick/dock claim counters so two robots sharing a low-stock pallet or an empty pallet to replenish
+  don't each independently propose a conflicting action every tick forever) → apply the batch, with
+  defensive recovery (drop and force-replan just the offending robot(s) rather than crash) if the
+  engine ever rejects an action → log → prune. A stall watchdog triggers a global replan if any
+  robot makes no progress for too many consecutive ticks.
 - `warehouse/cli/` — `solve.py`, `validate.py` (see Commands above)
 
 ## Problem model

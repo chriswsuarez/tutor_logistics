@@ -9,7 +9,7 @@ from warehouse.model.world import WorldState
 from warehouse.planning.cooperative_astar import GoalSpec, adjacent_to, any_row, exact_cell, plan
 from warehouse.planning.reservation import ReservationTable
 from warehouse.tasks.pallet_selector import PalletSelectionPolicy, nearest_pallet_of_sku
-from warehouse.tasks.task_types import CollectSkuSubGoal, DeliverSubGoal, ReplenishSubGoal, SubGoal
+from warehouse.tasks.task_types import CollectSkuSubGoal, DeliverSubGoal, RelocateSubGoal, ReplenishSubGoal, SubGoal
 
 _RETRY_MAX_EXPANSIONS = 200_000
 # Approaching a pallet from its north cell docks it to the robot's south side,
@@ -77,6 +77,8 @@ class RobotController:
             return self._step_collect(subgoal, world, reservation_table, claimed_picks)
         if isinstance(subgoal, DeliverSubGoal):
             return self._step_deliver(world, reservation_table)
+        if isinstance(subgoal, RelocateSubGoal):
+            return self._step_relocate(subgoal, world, reservation_table, claimed_docks)
         return self._step_replenish(subgoal, world, reservation_table, claimed_docks)
 
     def _drop_satisfied_subgoals(self, world: WorldState) -> None:
@@ -115,6 +117,8 @@ class RobotController:
                 # Every pallet of this SKU is currently empty: divert to
                 # replenish the nearest one before resuming collection.
                 nearest_id = self._nearest_pallet_of_sku(subgoal.sku, robot.position, world)
+                if nearest_id is None:
+                    return None  # every instance is already being replenished by another robot; wait
                 origin = world.pallets[nearest_id].position
                 self.subgoals.appendleft(ReplenishSubGoal(pallet_id=nearest_id, resume=subgoal, origin=origin))
                 self.pending_path = None
@@ -182,6 +186,43 @@ class RobotController:
 
         self.subgoals.popleft()
         self.subgoals.appendleft(subgoal.resume)
+        self.pending_path = None
+        self._target_pallet_id = None
+        return Action("undock", pallet.position.x, pallet.position.y)
+
+    def _step_relocate(
+        self,
+        subgoal: RelocateSubGoal,
+        world: WorldState,
+        reservation_table: ReservationTable,
+        claimed_docks: set[int],
+    ):
+        robot = world.robots[self.robot_id]
+        pallet = world.pallets[subgoal.pallet_id]
+
+        if pallet.position == subgoal.target and pallet.docked_to is None:
+            self.subgoals.popleft()
+            self.pending_path = None
+            return None
+
+        if pallet.docked_to != self.robot_id:
+            if robot.position not in set(world.grid.neighbors4(pallet.position)):
+                return self._advance_along_path_to(adjacent_to(pallet.position, world.grid), world, reservation_table)
+            if pallet.id in claimed_docks:
+                return None  # someone else is already docking this pallet this tick; retry next tick
+            claimed_docks.add(pallet.id)
+            return Action("dock", pallet.position.x, pallet.position.y)
+
+        # Relocation targets sit deep inside the grid (y in [1, R], nowhere near
+        # either y=0 or y=height-1), so unlike replenish-docking there is no
+        # direction whose resulting undock position could ever land out of
+        # bounds -- no exclude_offsets needed for the approach above.
+        offset = next(off for off, pid in robot.docked_pallets.items() if pid == subgoal.pallet_id)
+        target_robot_pos = Coord(subgoal.target.x - offset.x, subgoal.target.y - offset.y)
+        if robot.position != target_robot_pos:
+            return self._advance_along_path_to(exact_cell(target_robot_pos), world, reservation_table)
+
+        self.subgoals.popleft()
         self.pending_path = None
         self._target_pallet_id = None
         return Action("undock", pallet.position.x, pallet.position.y)
@@ -263,7 +304,7 @@ class RobotController:
             return candidate
         return None
 
-    def _nearest_pallet_of_sku(self, sku: int, from_coord: Coord, world: WorldState) -> int:
+    def _nearest_pallet_of_sku(self, sku: int, from_coord: Coord, world: WorldState) -> Optional[int]:
         """Nearest pallet of `sku`, regardless of stock (used only for the
         replenish-fallback, where every instance is currently empty),
         preferring one with a structurally reachable side excluding north
@@ -272,7 +313,11 @@ class RobotController:
         strand somewhere permanently unreachable (e.g. wedged between two
         other pallets at the grid edge) would deadlock every future order
         needing that SKU forever, even when a farther but reachable pallet
-        of the same SKU exists."""
+        of the same SKU exists. Also excludes any pallet already docked to
+        another robot (already being replenished) with no fallback -- see
+        `nearest_pallet_of_sku`'s `exclude_docked` docstring for why;
+        returns None (caller waits) if every instance is currently spoken
+        for."""
         return nearest_pallet_of_sku(
             sku,
             from_coord,
@@ -280,6 +325,7 @@ class RobotController:
             require_stock=False,
             require_reachable=True,
             excluded_offsets=_REPLENISH_DOCK_EXCLUDED_OFFSETS,
+            exclude_docked=True,
         )
 
     def reset_path(self) -> None:
