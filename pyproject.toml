@@ -1,0 +1,25 @@
+[project]
+name = "warehouse"
+version = "0.1.0"
+description = "Cooperative multi-robot warehouse order-fulfillment solver"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: full-scale runs (e.g. the real Big Order) excluded from the default run",
+]
+
+[tool.ruff]
+line-length = 100
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["warehouse*"]
